@@ -38,13 +38,17 @@ class Module:
             if Gtk.Widget.get_default_direction() == Gtk.TextDirection.RTL:
                 button_options.append([":minimize,maximize,close", _("Left")])
                 button_options.append(["menu:minimize,maximize,close", _("Left with Menu")])
+                button_options.append(["menu:maximize,minimize,close", _("Mac Left with Menu")])
                 button_options.append(["close,maximize,minimize:", _("Right")])
                 button_options.append(["close,maximize,minimize:menu", _("Right with Menu")])
+                button_options.append(["close,minimize,maximize:menu", _("Mac Right with Menu")])
             else:
                 button_options.append([":minimize,maximize,close", _("Right")])
                 button_options.append(["menu:minimize,maximize,close", _("Right with Menu")])
+                button_options.append(["menu:maximize,minimize,close", _("Mac Right with Menu")])
                 button_options.append(["close,maximize,minimize:", _("Left")])
                 button_options.append(["close,maximize,minimize:menu", _("Left with Menu")])
+                button_options.append(["close,minimize,maximize:menu", _("Mac Left with Menu")])
             button_options.append([":close", _("Gnome")])
             button_options.append(["close:minimize,maximize", _("Classic Mac")])
 
