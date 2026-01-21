@@ -1,0 +1,1036 @@
+#!/usr/bin/python3
+
+"""
+
+Fedora version of cinnamon-remove-application (enables the uninstall option in the right click Cinnamon application menu).
+Based and adapted from original cinnamon-remove-application script from Linux Mint.
+
+Created on 2025.12.15
+
+@Authors: Linux Mint Team (Original Cinnamon-remove-application script)
+          Alan Paris (Tuxman2)
+
+"""
+
+import os
+import sys
+import subprocess
+import gettext
+import gi
+import threading
+import time
+
+gi.require_version('Gtk', '3.0')
+from gi.repository import Gtk, GLib, Gdk
+
+# i18n: domain and locale dir
+LOCALE_DIR = "/usr/share/locale"
+DOMAIN = "remove-rpmflatpak-application"
+
+try:
+    t = gettext.translation(DOMAIN, LOCALE_DIR, fallback=True)
+    t.install()
+except Exception:
+    gettext.install(DOMAIN, LOCALE_DIR, fallback=True)
+
+# Critical Fedora Cinnamon/system packages to never remove automatically
+DONT_REMOVE = [
+    "cinnamon",
+    "cinnamon-desktop",
+    "cinnamon-session",
+    "cinnamon-control-center",
+    "cinnamon-settings-daemon",
+    "nemo",
+    "fedora-release-workstation",
+    "fedora-release",
+]
+
+ICON_SIZE = 48  # All icons are the same size
+
+
+def _load_symbolic_icon(icon_name, size):
+    icon_theme = Gtk.IconTheme.get_default()
+    try:
+        pixbuf = icon_theme.load_icon(icon_name, size, 0)
+        return Gtk.Image.new_from_pixbuf(pixbuf)
+    except Exception:
+        return None
+
+
+def add_warning_icon(dialog):
+    """Symbolic warning icon (menu entry, package list)."""
+    image = _load_symbolic_icon("dialog-warning-symbolic", ICON_SIZE)
+    if image is None:
+        return
+    dialog.set_image(image)
+    image.show()
+
+
+def add_error_icon(dialog):
+    """Symbolic error icon (system dependencies, Flatpak errors)."""
+    image = _load_symbolic_icon("dialog-error-symbolic", ICON_SIZE)
+    if image is None:
+        return
+    dialog.set_image(image)
+    image.show()
+
+
+def install_progressbar_css():
+    """
+    Install a CSS provider to style the progress bar:
+    - small height (8px)
+    - sky blue color
+    """
+    css = b"""
+    progressbar trough, progressbar progress {
+        min-height: 8px;
+    }
+    progressbar progress {
+        background-image: none;
+        background-color: #66B2FF;
+    }
+    """
+    css_provider = Gtk.CssProvider()
+    css_provider.load_from_data(css)
+    screen = Gdk.Screen.get_default()
+    Gtk.StyleContext.add_provider_for_screen(
+        screen,
+        css_provider,
+        Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+    )
+
+
+def install_textview_css(widget):
+    """
+    Install a CSS provider to style the details TextView:
+    - black background
+    - light foreground text
+    """
+    css = b"""
+    textview text {
+        background-color: #000000;
+        color: #EEEEEE;
+    }
+    """
+    css_provider = Gtk.CssProvider()
+    css_provider.load_from_data(css)
+    style_context = widget.get_style_context()
+    style_context.add_provider(
+        css_provider,
+        Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+    )
+
+class CustomSpinner(Gtk.EventBox):
+    """Simple colored spinning circle using Image + CSS rotation."""
+
+    def __init__(self, size=32):
+        super(CustomSpinner, self).__init__()
+
+        # Add a custom CSS class to the container so we can target it in CSS
+        self.get_style_context().add_class("spinner-container")
+
+        # Icon
+        self.image = Gtk.Image.new_from_icon_name(
+            "process-working-symbolic",
+            Gtk.IconSize.DIALOG
+        )
+        self.image.set_pixel_size(size)
+        self.add(self.image)
+
+        # CSS animation
+        css = b"""
+        .spinner-container > image {
+            animation-name: spin;
+            animation-duration: 1s;
+            animation-timing-function: linear;
+            animation-iteration-count: infinite;
+        }
+
+        @keyframes spin {
+            to { -gtk-icon-transform: rotate(1turn); }
+        }
+        """
+
+        provider = Gtk.CssProvider()
+        provider.load_from_data(css)
+
+        # Register the CSS provider on the default screen so it applies globally
+        Gtk.StyleContext.add_provider_for_screen(
+            Gdk.Screen.get_default(),
+            provider,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+        )
+                 
+class ProgressDialog(Gtk.Dialog):
+    """
+    Progress dialog used for RPM removal.
+    Flatpak uses a separate, simpler dialog with a spinner.
+    """
+
+    def __init__(self, parent, is_flatpak, main_title, main_message,
+                 desktop_file=None, flatpak_id=None):
+        Gtk.Dialog.__init__(self, title=main_title, transient_for=parent, flags=0)
+        self.set_modal(True)
+        self.set_border_width(12)
+        self.set_default_size(650, 400)
+        self.set_keep_above(True)
+
+        # Prevent closing via the titlebar close button
+        self.set_deletable(False)
+        self.connect("delete-event", self._on_delete_event)
+
+        # Add a Cancel button at the bottom right, initially insensitive (greyed out)
+        self.add_button(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL)
+        self.set_response_sensitive(Gtk.ResponseType.CANCEL, False)
+        self.connect("response", self._on_response)
+
+        content = self.get_content_area()
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        content.add(vbox)
+
+        # Top area: labels (no app icon here)
+        hbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        vbox.pack_start(hbox, False, False, 0)
+
+        label_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        hbox.pack_start(label_box, True, True, 0)
+
+        self.main_label = Gtk.Label()
+        self.main_label.set_xalign(0.0)
+        self.main_label.set_line_wrap(True)
+        safe_message = GLib.markup_escape_text(main_message)
+        self.main_label.set_markup(
+            f'<span weight="bold" size="larger">{safe_message}</span>'
+        )
+        label_box.pack_start(self.main_label, False, False, 0)
+
+        self.progressbar = Gtk.ProgressBar()
+        self.progressbar.set_show_text(False)
+        label_box.pack_start(self.progressbar, False, False, 0)
+
+        self.sub_label = Gtk.Label()
+        self.sub_label.set_xalign(0.0)
+        self.sub_label.set_line_wrap(True)
+        self.sub_label.get_style_context().add_class("dim-label")
+        label_box.pack_start(self.sub_label, False, False, 0)
+
+        # Expander with textual details
+        self.expander = Gtk.Expander(label=_("Details"))
+        vbox.pack_start(self.expander, True, True, 0)
+
+        scrolled = Gtk.ScrolledWindow()
+        scrolled.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        scrolled.set_min_content_width(600)
+        scrolled.set_min_content_height(250)
+        self.expander.add(scrolled)
+
+        self.textview = Gtk.TextView()
+        self.textview.set_editable(False)
+        self.textview.set_cursor_visible(False)
+        self.textbuffer = self.textview.get_buffer()
+        scrolled.add(self.textview)
+
+        # Apply dark theme for details view
+        install_textview_css(self.textview)
+
+        self._progress_fraction = 0.0
+        self._progress_done = False
+
+        # Slow animation used only when no explicit progress is set
+        self._progress_timeout_id = GLib.timeout_add(120, self._slow_progress_tick)
+
+        self.show_all()
+
+    def _on_delete_event(self, *args):
+        """Prevent closing via the titlebar button."""
+        return True
+
+    def _on_response(self, dialog, response_id):
+        """
+        Handle Cancel button.
+        For now this simply closes the dialog; it does not kill the dnf process.
+        """
+        if response_id == Gtk.ResponseType.CANCEL:
+            # Get the parent window (FedoraRemoveWindow.window)
+            parent = self.get_transient_for()
+            # Close the progress dialog
+            self.destroy()
+            # Close the parent window if it exists
+            if parent is not None:
+                parent.destroy()
+
+    def enable_cancel(self):
+        """Enable the Cancel button (used when an error occurs)."""
+        self.set_response_sensitive(Gtk.ResponseType.CANCEL, True)
+
+    def _slow_progress_tick(self):
+        """Slow animation when no explicit progress is provided."""
+        if self._progress_done:
+            return False
+        if self._progress_fraction < 0.98:
+            self._progress_fraction += 0.01
+        self.progressbar.set_fraction(self._progress_fraction)
+        return True
+
+    def finalize_progress(self):
+        """Force progress bar to 100% and stop animation."""
+        self._progress_done = True
+        self.progressbar.set_fraction(1.0)
+
+    def set_progress_fraction(self, fraction):
+        """
+        Set explicit fraction and stop the slow animation.
+        This is used by our step controller to make the bar jump by steps.
+        """
+        self._progress_done = True
+        self._progress_fraction = max(0.0, min(1.0, fraction))
+        self.progressbar.set_fraction(self._progress_fraction)
+
+    def append_log_line(self, line):
+        """Append a line to the details TextView."""
+        end_iter = self.textbuffer.get_end_iter()
+        self.textbuffer.insert(end_iter, line + "\n")
+        mark = self.textbuffer.create_mark(None, self.textbuffer.get_end_iter(), True)
+        self.textview.scroll_mark_onscreen(mark)
+
+    def set_sub_message(self, text):
+        """Update the secondary message label."""
+        self.sub_label.set_text(text)
+
+    def auto_close_with_delay(self, delay_ms=1500):
+        """Automatically close the dialog after a short delay."""
+        def _close_later():
+            self.response(Gtk.ResponseType.CLOSE)
+            return False
+        GLib.timeout_add(delay_ms, _close_later)
+
+
+class FlatpakSpinnerDialog(Gtk.Dialog):
+    """
+    Simple Flatpak removal dialog:
+      - no headerbar buttons explicitly added
+      - window title "Removing"
+      - slightly wider default size (400px)
+      - height is computed from natural content size
+      - bold, larger label inside: the real application name
+      - centered custom spinner (32x32) with classic appearance
+      - closes automatically after a small delay
+    """
+
+    def __init__(self, parent, app_name):
+        # Create a modal dialog attached to the parent window
+        Gtk.Dialog.__init__(self, title=_("Removing"), transient_for=parent, flags=0)
+
+        self.set_modal(True)
+        self.set_border_width(16)
+
+        # Width fixed to 400px, height set to -1 so GTK uses natural height
+        self.set_default_size(400, -1)
+
+        # Keep the dialog above other windows and allow closing via window controls
+        self.set_keep_above(True)
+        self.set_deletable(True)
+
+        # Main vertical box in the dialog content area
+        content = self.get_content_area()
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16)
+        vbox.set_border_width(16)
+        content.add(vbox)
+
+        # Application name label, bold and centered
+        safe_name = GLib.markup_escape_text(app_name)
+        app_label = Gtk.Label()
+        app_label.set_use_markup(True)
+        app_label.set_xalign(0.5)
+        app_label.set_line_wrap(True)
+        app_label.set_justify(Gtk.Justification.CENTER)
+        app_label.set_markup(
+            f'<span weight="bold" size="large">{safe_name}</span>'
+        )
+        vbox.pack_start(app_label, False, False, 0)
+
+        # Container to center the spinner in the dialog
+        spinner_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        spinner_box.set_halign(Gtk.Align.CENTER)
+        spinner_box.set_valign(Gtk.Align.CENTER)
+        vbox.pack_start(spinner_box, True, True, 0)
+
+        # Custom spinner with classic appearance (32x32)
+        self.spinner = CustomSpinner(size=32)
+        spinner_box.pack_start(self.spinner, False, False, 0)
+
+        # Ensure everything becomes visible
+        self.show_all()
+
+    def auto_close_with_delay(self, delay_ms=1500):
+        """
+        Automatically close the dialog after a small delay.
+        """
+
+        def _close_later():
+            self.response(Gtk.ResponseType.CLOSE)
+            return False
+
+        GLib.timeout_add(delay_ms, _close_later)
+
+
+class FedoraRemoveWindow:
+    def __init__(self, desktop_file):
+        self.desktop_file = desktop_file
+        self.window = Gtk.Window()
+        self.window.set_default_size(1, 1)
+        self.window.set_position(Gtk.WindowPosition.CENTER)
+        self.window.set_decorated(False)
+        self.window.connect("destroy", Gtk.main_quit)
+
+        install_progressbar_css()
+
+        pkg = self.find_rpm_package(desktop_file)
+        if pkg:
+            # Run the dnf simulation in a background thread
+            threading.Thread(
+                target=self._run_dnf_simulation,
+                args=(pkg,),
+                daemon=True
+            ).start()
+        else:
+            self.handle_non_rpm(desktop_file)
+
+    def find_rpm_package(self, path):
+        """Return the RPM package name owning the given path, or None."""
+        try:
+            result = subprocess.run(
+                ["rpm", "-qf", "--qf", "%{NAME}\n", path],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                check=False,
+                text=True
+            )
+            if result.returncode != 0:
+                return None
+            lines = [l.strip() for l in result.stdout.splitlines() if l.strip()]
+            if not lines:
+                return None
+            return lines[0]
+        except Exception:
+            return None
+
+    def _run_dnf_simulation(self, pkg):
+        """Run DNF remove simulation in a background thread."""
+        packages_to_remove = self.simulate_dnf_remove(pkg)
+        GLib.idle_add(self._after_dnf_simulation, pkg, packages_to_remove)
+
+    def _after_dnf_simulation(self, pkg, packages_to_remove):
+        """Handle the result of the DNF simulation."""
+        if not packages_to_remove:
+            if self.window is not None:
+                self.window.destroy()
+            return False
+
+        # packages_to_remove is a list of (short_name, full_nevra)
+        full_names = [full for _, full in packages_to_remove]
+
+        if any(p in DONT_REMOVE for p in full_names):
+            self.no_remove_dialog(pkg, full_names)
+            if self.window is not None:
+                self.window.destroy()
+        else:
+            self.remove_dialog(packages_to_remove)
+
+        return False
+
+    def simulate_dnf_remove(self, package):
+        """
+        Run `dnf remove PACKAGE --assumeno` and parse packages to remove.
+        Uses `rpm -q --qf "%{NAME}"` on each NEVRA for accurate short_name extraction.
+        """
+        try:
+            cmd = ["dnf", "remove", package, "--assumeno"]
+            env = os.environ.copy()
+            env["LC_ALL"] = "C"
+            result = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                check=False,
+                env=env
+            )
+            output = result.stdout
+            packages = []
+            in_section = False
+
+            for line in output.splitlines():
+                line = line.strip()
+                if not line:
+                    in_section = False
+                    continue
+                if (line.startswith("Removing") or
+                        line.startswith("Removing dependent packages")):
+                    in_section = True
+                    continue
+                if in_section:
+                    parts = line.split()
+                    if not parts:
+                        continue
+                    full_nevra = parts[0]
+                    # Extract short_name using rpm query (100% accurate)
+                    try:
+                        rpm_result = subprocess.run(
+                            ["rpm", "-q", "--qf", "%{NAME}", full_nevra],
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.DEVNULL,
+                            text=True,
+                            check=False
+                        )
+                        if rpm_result.returncode == 0:
+                            short_name = rpm_result.stdout.strip()
+                        else:
+                            # Fallback: original logic
+                            dash_parts = full_nevra.split("-")
+                            if len(dash_parts) >= 3:
+                                name_with_epoch = "-".join(dash_parts[:-2])
+                            else:
+                                name_with_epoch = dash_parts[0]
+                            short_name = name_with_epoch.split(":", 1)[0]
+                    except Exception:
+                        short_name = full_nevra.split("-")[0]
+
+                    packages.append((short_name, full_nevra))
+
+            # De-duplicate while preserving order
+            seen = set()
+            ordered = []
+            for short_name, full_nevra in packages:
+                if full_nevra not in seen:
+                    seen.add(full_nevra)
+                    ordered.append((short_name, full_nevra))
+
+            return ordered
+        except Exception:
+            return []
+
+    def handle_non_rpm(self, desktop_file):
+        """Handle .desktop files that are not owned by an RPM."""
+        if "flatpak" in desktop_file.lower():
+            # Do not destroy parent here; it is needed for the progress dialog
+            self.try_remove_flatpak(desktop_file)
+            return
+
+        self.ask_remove_desktop_file(desktop_file)
+        if self.window is not None:
+            self.window.destroy()
+
+    def try_remove_flatpak(self, desktop_file):
+        """Ask whether to uninstall a Flatpak."""
+        base = os.path.basename(desktop_file)
+        if base.endswith(".desktop"):
+            flatpak_id = base[:-8]
+        else:
+            flatpak_id = base
+
+        # Try to get a more user-friendly application name from the desktop file
+        app_name = flatpak_id
+        try:
+            with open(desktop_file, "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    line = line.strip()
+                    if line.startswith("Name="):
+                        app_name = line.split("=", 1)[1].strip()
+                        break
+        except Exception:
+            pass
+
+        dlg = Gtk.MessageDialog(
+            parent=self.window,
+            flags=0,
+            message_type=Gtk.MessageType.QUESTION,
+            buttons=Gtk.ButtonsType.YES_NO,
+            text=_(
+                "This application seems to be a Flatpak (%s). "
+                "Do you want to uninstall it using Flatpak?"
+            ) % flatpak_id
+        )
+        dlg.set_border_width(12)
+        add_warning_icon(dlg)
+        resp = dlg.run()
+        dlg.destroy()
+
+        if resp == Gtk.ResponseType.YES:
+            self.run_flatpak_uninstall_with_progress(flatpak_id, app_name)
+            return True
+        else:
+            if self.window is not None:
+                self.window.destroy()
+        return False
+
+    def ask_remove_desktop_file(self, desktop_file):
+        """Ask whether to remove the .desktop file from the menu."""
+        dlg = Gtk.MessageDialog(
+            parent=self.window,
+            flags=0,
+            message_type=Gtk.MessageType.WARNING,
+            buttons=Gtk.ButtonsType.YES_NO,
+            text=_(
+                "This menu item is not associated with any package. "
+                "Do you want to remove it from the menu anyway?"
+            )
+        )
+        dlg.set_border_width(12)
+        add_warning_icon(dlg)
+        resp = dlg.run()
+        dlg.destroy()
+
+        if resp == Gtk.ResponseType.YES:
+            try:
+                os.remove(desktop_file)
+            except OSError:
+                subprocess.call(["pkexec", "rm", "-f", desktop_file])
+
+    def remove_dialog(self, packages_to_remove):
+        """
+        Show a dialog listing the packages that will be removed by DNF.
+        packages_to_remove is a list of (short_name, full_nevra) tuples.
+        The first tuple is treated as the main package, the others as dependencies.
+        """
+        warnDlg = Gtk.MessageDialog(
+            parent=self.window,
+            flags=0,
+            message_type=Gtk.MessageType.WARNING,
+            buttons=Gtk.ButtonsType.OK_CANCEL,
+            text=_("The following packages will be removed:")
+        )
+        warnDlg.set_keep_above(True)
+        warnDlg.vbox.set_spacing(12)
+        add_warning_icon(warnDlg)
+
+        treeview = Gtk.TreeView()
+        column1 = Gtk.TreeViewColumn(_("Packages to remove"))
+        renderer = Gtk.CellRendererText()
+        column1.pack_start(renderer, False)
+        column1.add_attribute(renderer, "text", 0)
+        treeview.append_column(column1)
+
+        model = Gtk.ListStore(str)
+        for short_name, full_nevra in packages_to_remove:
+            # Show full NEVRA in the confirmation list
+            model.append([full_nevra])
+        treeview.set_model(model)
+
+        scrolledwindow = Gtk.ScrolledWindow()
+        scrolledwindow.set_shadow_type(Gtk.ShadowType.ETCHED_OUT)
+        scrolledwindow.set_size_request(300, 200)
+        scrolledwindow.add(treeview)
+
+        warnDlg.get_content_area().add(scrolledwindow)
+        warnDlg.set_border_width(12)
+        warnDlg.show_all()
+
+        response = warnDlg.run()
+        warnDlg.destroy()
+
+        if response == Gtk.ResponseType.OK:
+            self.run_dnf_remove_with_progress(packages_to_remove)
+        else:
+            if self.window is not None:
+                self.window.destroy()
+
+    def no_remove_dialog(self, package, rdependencies):
+        """Show an error dialog when the package cannot be removed."""
+        warnDlg = Gtk.MessageDialog(
+            parent=self.window,
+            flags=0,
+            message_type=Gtk.MessageType.ERROR,
+            buttons=Gtk.ButtonsType.CLOSE,
+            text=_(
+                "Cannot remove package %s because it is required by a system package."
+            ) % package
+        )
+        warnDlg.set_keep_above(True)
+        warnDlg.vbox.set_spacing(12)
+        add_error_icon(warnDlg)
+
+        treeview = Gtk.TreeView()
+        column1 = Gtk.TreeViewColumn(
+            _("Package %s is a dependency of the following packages:") % package
+        )
+        renderer = Gtk.CellRendererText()
+        column1.pack_start(renderer, False)
+        column1.add_attribute(renderer, "text", 0)
+        treeview.append_column(column1)
+
+        model = Gtk.ListStore(str)
+        for dep in rdependencies:
+            model.append([dep])
+        treeview.set_model(model)
+
+        scrolledwindow = Gtk.ScrolledWindow()
+        scrolledwindow.set_shadow_type(Gtk.ShadowType.ETCHED_OUT)
+        scrolledwindow.set_size_request(300, 200)
+        scrolledwindow.add(treeview)
+
+        warnDlg.get_content_area().add(scrolledwindow)
+        warnDlg.set_border_width(12)
+        warnDlg.show_all()
+        warnDlg.run()
+        warnDlg.destroy()
+
+    # ---------- Helper for staged UI steps with minimal durations (RPM only) ----------
+    def _create_step_controller(self, dlg, total_steps, initial_step=0):
+        """
+        Create a controller object for staged progress:
+        - ensures that each step is visible for a minimal duration
+        - keeps progress bar and sub-message in sync
+        """
+        controller = {
+            "dlg": dlg,
+            "total_steps": float(total_steps),
+            "current_step": initial_step,
+            "last_step_time": time.monotonic(),
+        }
+
+        def set_step(step_index, sub_message, min_duration_ms, details_line=None):
+            """
+            Move to a new logical step, but ensure that the previous step
+            stays visible for at least min_duration_ms.
+            Optionally append a synchronized details line.
+            """
+            if controller["dlg"] is None:
+                return
+
+            if step_index == controller["current_step"]:
+                controller["dlg"].set_sub_message(sub_message)
+                if details_line is not None:
+                    controller["dlg"].append_log_line(details_line)
+                return
+
+            now = time.monotonic()
+            elapsed_ms = (now - controller["last_step_time"]) * 1000.0
+
+            def apply_step():
+                if controller["dlg"] is None:
+                    return False
+                controller["current_step"] = step_index
+                controller["last_step_time"] = time.monotonic()
+                fraction = float(step_index) / controller["total_steps"]
+                controller["dlg"].set_progress_fraction(fraction)
+                controller["dlg"].set_sub_message(sub_message)
+                if details_line is not None:
+                    controller["dlg"].append_log_line(details_line)
+                return False
+
+            if elapsed_ms >= min_duration_ms:
+                apply_step()
+            else:
+                GLib.timeout_add(int(min_duration_ms - elapsed_ms), apply_step)
+
+        controller["set_step"] = set_step
+        return controller
+
+    # ---------- DNF removal with staged progress (unchanged) ----------
+    def run_dnf_remove_with_progress(self, packages):
+        """
+        Run DNF remove with pkexec, showing staged progress with minimal durations.
+        """
+        if not packages:
+            return
+
+        main_short, main_full = packages[0]
+        deps = packages[1:]
+        num_packages = len(packages)
+
+        total_steps = 2 + num_packages + 1
+
+        progress_dialog_holder = {"dlg": None}
+        step_controller_holder = {"controller": None}
+        current_package_step = {"index": 2}
+
+        MIN_MS_APPLYING = 1000
+        MIN_MS_DEFERRED = 1000
+        MIN_MS_REMOVING = 1000
+
+        def ensure_dialog():
+            """
+            Create the ProgressDialog only after the first output line from dnf,
+            which means authorization has succeeded.
+            """
+            if progress_dialog_holder["dlg"] is None:
+                dlg = ProgressDialog(
+                    parent=self.window,
+                    is_flatpak=False,
+                    main_title=_("Remove packages"),
+                    main_message=_("Removing packages")
+                )
+                dlg.set_sub_message(_("Applying changes..."))
+                progress_dialog_holder["dlg"] = dlg
+                step_controller_holder["controller"] = self._create_step_controller(
+                    dlg, total_steps, initial_step=0
+                )
+            return progress_dialog_holder["dlg"]
+
+        def worker():
+            cmd = ["pkexec", "dnf", "remove", "-y"] + [full for _, full in packages]
+            env = os.environ.copy()
+            env["LC_ALL"] = "C"
+
+            process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                env=env
+            )
+
+            first_output_seen = False
+            pre_deferred_done = False
+
+            for raw_line in iter(process.stdout.readline, ''):
+                line = raw_line.rstrip("\n")
+
+                def update_ui(l=line):
+                    nonlocal first_output_seen, pre_deferred_done
+                    if not l:
+                        return False
+
+                    dlg = ensure_dialog()
+                    controller = step_controller_holder["controller"]
+                    dlg.append_log_line(l)
+
+                    if not first_output_seen:
+                        first_output_seen = True
+                        controller["set_step"](
+                            step_index=1,
+                            sub_message=_("Applying changes..."),
+                            min_duration_ms=MIN_MS_APPLYING,
+                            details_line=_("Applying changes...")
+                        )
+                        return False
+
+                    if ("Removing" in l) and (not pre_deferred_done):
+                        pre_deferred_done = True
+                        controller["set_step"](
+                            step_index=2,
+                            sub_message=_("Running deferred actions for dnf..."),
+                            min_duration_ms=MIN_MS_DEFERRED,
+                            details_line=_("Running deferred actions for dnf...")
+                        )
+                        return False
+
+                    return False
+
+                GLib.idle_add(update_ui)
+
+            ret = process.wait()
+
+            def finalize():
+                dlg = progress_dialog_holder["dlg"]
+                controller = step_controller_holder["controller"]
+
+                if ret != 0:
+                    if dlg is not None:
+                        msg = _("Removal failed or cancelled.")
+                        dlg.append_log_line(msg)
+                        dlg.set_sub_message(msg)
+                        dlg.enable_cancel()
+                        dlg.auto_close_with_delay(2000)
+                    else:
+                        if self.window is not None:
+                            self.window.destroy()
+                    return False
+
+                if dlg is None or controller is None:
+                    if self.window is not None:
+                        self.window.destroy()
+                    return False
+
+                ordered_packages = [(main_short, main_full)] + deps
+                delay_accumulator = 0
+
+                def make_package_step(step_idx, short_name, full_nevra, offset_ms):
+                    def _step():
+                        sub_msg = _("Removing %s") % short_name
+                        details_msg = _("Removing %s") % full_nevra
+                        controller["set_step"](
+                            step_index=step_idx,
+                            sub_message=sub_msg,
+                            min_duration_ms=MIN_MS_REMOVING,
+                            details_line=details_msg
+                        )
+                        return False
+
+                    GLib.timeout_add(offset_ms, _step)
+
+                for short_name, full_nevra in ordered_packages:
+                    current_package_step["index"] += 1
+                    step_idx = current_package_step["index"]
+                    delay_accumulator += MIN_MS_REMOVING
+                    make_package_step(step_idx, short_name, full_nevra, delay_accumulator)
+
+                final_step_index = total_steps
+                delay_accumulator += MIN_MS_DEFERRED
+
+                def _final_deferred():
+                    controller["set_step"](
+                        step_index=final_step_index,
+                        sub_message=_("Running deferred actions for dnf..."),
+                        min_duration_ms=MIN_MS_DEFERRED,
+                        details_line=_("Running deferred actions for dnf...")
+                    )
+                    return False
+
+                GLib.timeout_add(delay_accumulator, _final_deferred)
+                delay_accumulator += MIN_MS_DEFERRED
+
+                def _finish():
+                    if dlg is None:
+                        return False
+                    dlg.finalize_progress()
+                    dlg.set_sub_message(_("Removal finished."))
+                    dlg.append_log_line(_("Removal finished."))
+                    dlg.auto_close_with_delay(1500)
+                    return False
+
+                GLib.timeout_add(delay_accumulator, _finish)
+
+                def _destroy_parent():
+                    if self.window is not None:
+                        self.window.destroy()
+                    return False
+
+                GLib.timeout_add(delay_accumulator + 2000, _destroy_parent)
+                return False
+
+            GLib.idle_add(finalize)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    # ---------- Flatpak removal with simple spinner dialog ----------
+    def run_flatpak_uninstall_with_progress(self, flatpak_id, app_name):
+        """
+        Run flatpak uninstall with pkexec, showing a simple spinner dialog
+        only if pkexec authentication has succeeded.
+        Command is:
+          flatpak uninstall -y <id> && flatpak uninstall -y --unused
+        The graphical dialog is only a visual indicator and does not control the process.
+        """
+        if not flatpak_id:
+            return
+
+        # The dialog is created lazily after first output from pkexec/flatpak,
+        # which implies that authorization has completed successfully.
+        spinner_holder = {"dlg": None}
+
+        def ensure_dialog():
+            if spinner_holder["dlg"] is None:
+                spinner_holder["dlg"] = FlatpakSpinnerDialog(
+                    parent=self.window,
+                    app_name=app_name
+                )
+            return spinner_holder["dlg"]
+
+        def worker():
+            cmd = [
+                "pkexec", "sh", "-c",
+                f"flatpak uninstall -y {flatpak_id} && flatpak uninstall -y --unused"
+            ]
+            env = os.environ.copy()
+            env["LC_ALL"] = "C"
+
+            process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                env=env
+            )
+
+            first_output_seen = False
+
+            # Read output line by line; first line indicates that pkexec
+            # is done and the command is actually running.
+            for raw_line in iter(process.stdout.readline, ''):
+                line = raw_line.rstrip("\n")
+
+                def update_ui(l=line):
+                    nonlocal first_output_seen
+                    # Ignore empty noise lines
+                    if not l and first_output_seen:
+                        return False
+
+                    if not first_output_seen and l:
+                        first_output_seen = True
+                        ensure_dialog()
+                    return False
+
+                GLib.idle_add(update_ui)
+
+            ret = process.wait()
+
+            def finalize():
+                dlg = spinner_holder["dlg"]
+
+                if ret != 0:
+                    # 1. If the spinner exists, destroy it immediately
+                    if dlg is not None:
+                        dlg.destroy()
+                        spinner_holder["dlg"] = None
+
+                    # 2. Show only the error dialog
+                    errdlg = Gtk.MessageDialog(
+                        parent=self.window,
+                        flags=0,
+                        message_type=Gtk.MessageType.ERROR,
+                        buttons=Gtk.ButtonsType.CLOSE,
+                        text=_("Flatpak removal failed or cancelled.")
+                    )
+                    errdlg.set_border_width(12)
+                    add_error_icon(errdlg)
+                    errdlg.run()
+                    errdlg.destroy()
+
+                    # 3. Close the parent window
+                    if self.window is not None:
+                        self.window.destroy()
+                    return False
+
+                # Success path (unchanged, or almost unchanged)
+                if dlg is not None:
+                    dlg.auto_close_with_delay(700)
+
+                def _destroy_parent():
+                    if self.window is not None:
+                         self.window.destroy()
+                    return False
+
+                GLib.timeout_add(1500, _destroy_parent)
+                return False 
+
+            GLib.idle_add(finalize)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def run_dnf_remove(self, packages):
+        """Deprecated: kept for reference (non‑GUI)."""
+        if not packages:
+            return
+        cmd = ["pkexec", "dnf", "remove", "-y"] + packages
+        subprocess.call(cmd)
+
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        print(_("No path provided"))
+        sys.exit(1)
+
+    path = sys.argv[1]
+    if not os.path.exists(path):
+        dpath = f"{path}.desktop"
+        if os.path.exists(dpath):
+            path = dpath
+        else:
+            print(_("Path not found:"), path)
+            sys.exit(1)
+
+    mainwin = FedoraRemoveWindow(path)
+    Gtk.main()
+
